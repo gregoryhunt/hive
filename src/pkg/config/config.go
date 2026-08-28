@@ -5347,13 +5347,13 @@ func (c *Config) redactedForPersist() *Config {
 	cp := *c
 	cp.OTel.Headers = envRedactedHeaders(cp.OTel.Headers)
 	cp.Tracing.Headers = envRedactedHeaders(cp.Tracing.Headers)
-	// Work-source credentials: hive.yaml recommends `api_key: ${LINEAR_API_KEY}`,
-	// which Load expands into the real secret in memory. Fold it back into the
-	// ${VAR} reference on persist so the dashboard overlay (and the seed
-	// rewrite) stay secret-free; the worksource factory resolves the reference
-	// again at the point of use.
-	cp.Governor.WorkSource.Linear.APIKey = redactEnvExpandedValue(cp.Governor.WorkSource.Linear.APIKey)
-	cp.Governor.WorkSource.Jira.APIToken = redactEnvExpandedValue(cp.Governor.WorkSource.Jira.APIToken)
+	// Work-source credentials are persisted verbatim. The dashboard PUT stores
+	// the operator's literal `${LINEAR_API_KEY}` reference (API saves are not
+	// env-expanded) and worksource.FromConfig resolves it at the point of use,
+	// so the reference round-trips through the overlay unchanged. Do NOT try
+	// to "fold" a value back into ${VAR} by scanning the environment: any env
+	// value that is a substring of the key (CI's ACCEPT_EULA=Y rewrote the
+	// trailing Y of the literal reference) corrupts it.
 	// #4041: never write the built-in login-pattern defaults as explicit
 	// values. applyDefaults fills LoginPatterns on load, so by save time the
 	// in-memory list always LOOKS explicit; marshaling it pins today's

@@ -101,16 +101,18 @@ governor:
 	}
 }
 
-// TestRedactedForPersist_WorkSourceCredentials: a key loaded from
-// `api_key: ${LINEAR_API_KEY}` is the real secret in memory; the persisted copy
-// (seed rewrite and dashboard overlay) must fold it back into the reference.
+// TestRedactedForPersist_WorkSourceCredentials: the dashboard PUT stores the
+// operator's literal `${LINEAR_API_KEY}` reference (API saves are not
+// env-expanded) and worksource.FromConfig resolves it at use, so the persisted
+// copy (seed rewrite and dashboard overlay) must carry the reference through
+// unchanged, whether or not the variable is set in the environment.
 func TestRedactedForPersist_WorkSourceCredentials(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "lin_api_supersecretvalue0123456789")
 	t.Setenv("JIRA_API_TOKEN", "atlassian_supersecrettoken0123456789")
 	cfg := &Config{}
 	cfg.Governor.WorkSource.Type = "linear"
-	cfg.Governor.WorkSource.Linear.APIKey = "lin_api_supersecretvalue0123456789"
-	cfg.Governor.WorkSource.Jira.APIToken = "atlassian_supersecrettoken0123456789"
+	cfg.Governor.WorkSource.Linear.APIKey = "${LINEAR_API_KEY}"
+	cfg.Governor.WorkSource.Jira.APIToken = "${JIRA_API_TOKEN}"
 
 	red := cfg.redactedForPersist()
 	if got := red.Governor.WorkSource.Linear.APIKey; got != "${LINEAR_API_KEY}" {
@@ -119,8 +121,31 @@ func TestRedactedForPersist_WorkSourceCredentials(t *testing.T) {
 	if got := red.Governor.WorkSource.Jira.APIToken; got != "${JIRA_API_TOKEN}" {
 		t.Errorf("jira.api_token persisted as %q, want ${JIRA_API_TOKEN}", got)
 	}
-	// The in-memory config keeps the resolved value.
-	if strings.HasPrefix(cfg.Governor.WorkSource.Linear.APIKey, "${") {
+	if !strings.HasPrefix(cfg.Governor.WorkSource.Linear.APIKey, "${") {
 		t.Errorf("redactedForPersist mutated the live config: %q", cfg.Governor.WorkSource.Linear.APIKey)
+	}
+}
+
+// TestRedactedForPersist_WorkSourceRefSurvivesEnvSubstrings is the regression
+// for the CI failure on #4976: redactedForPersist used to scan os.Environ()
+// and replace every env VALUE found inside the key with ${NAME}. CI exports
+// ACCEPT_EULA=Y, so the trailing Y of the literal `${LINEAR_API_KEY}` became
+// `${LINEAR_API_KE${ACCEPT_EULA}}`. Any env value that is a substring of the
+// key corrupts it; the persisted value must be byte-identical to the input.
+func TestRedactedForPersist_WorkSourceRefSurvivesEnvSubstrings(t *testing.T) {
+	t.Setenv("ACCEPT_EULA", "Y")
+	t.Setenv("HIVE_TEST_SUBSTRING", "API_KEY")
+	t.Setenv("HIVE_TEST_DOLLAR", "${")
+	cfg := &Config{}
+	cfg.Governor.WorkSource.Type = "linear"
+	cfg.Governor.WorkSource.Linear.APIKey = "${LINEAR_API_KEY}"
+	cfg.Governor.WorkSource.Jira.APIToken = "${JIRA_API_TOKEN}"
+
+	red := cfg.redactedForPersist()
+	if got := red.Governor.WorkSource.Linear.APIKey; got != "${LINEAR_API_KEY}" {
+		t.Errorf("linear.api_key persisted as %q, want ${LINEAR_API_KEY} untouched", got)
+	}
+	if got := red.Governor.WorkSource.Jira.APIToken; got != "${JIRA_API_TOKEN}" {
+		t.Errorf("jira.api_token persisted as %q, want ${JIRA_API_TOKEN} untouched", got)
 	}
 }

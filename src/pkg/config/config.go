@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1341,6 +1342,16 @@ type WorkSourceConfig struct {
 	Linear LinearSourceConfig `yaml:"linear,omitempty" json:"linear,omitempty"`
 	// Jira configures the Jira Cloud REST v3 adapter.
 	Jira JiraSourceConfig `yaml:"jira,omitempty" json:"jira,omitempty"`
+}
+
+// IsZero reports whether no work source has been configured at all: no type
+// and no adapter-specific settings. Used by the dashboard-overlay reload to
+// decide whether the overlay carries an operator-set work source.
+func (w WorkSourceConfig) IsZero() bool {
+	return w.Type == "" &&
+		reflect.DeepEqual(w.GitHubProjects, GitHubProjectsSourceConfig{}) &&
+		reflect.DeepEqual(w.Linear, LinearSourceConfig{}) &&
+		reflect.DeepEqual(w.Jira, JiraSourceConfig{})
 }
 
 // GitHubProjectsSourceConfig configures the GitHub Projects v2 work source.
@@ -3876,6 +3887,18 @@ func LoadWithDashboardOverlay(path string) (*Config, error) {
 		cfg.Tracing = overlay.Tracing
 		cfg.OTel = mergeOTelOverride(cfg.OTel, overlay.Tracing)
 	}
+	// Governor work source: the dashboard's PUT /api/config/governor/work-source
+	// writes the whole config to the overlay, but the reload only adopted
+	// OTel/Tracing, RemovedAgents and Agents from it — so a work source set
+	// from the dashboard was lost on every pod restart and GET returned
+	// type "" again. Adopt it here, BEFORE the fullness guard, so a short
+	// overlay (no agents yet) still carries it. The whole block is copied so
+	// per-adapter settings (teams, hold labels, assigned_only, …) survive with
+	// the type. Nothing here touches overlay.Variables — see the security
+	// invariant at the end of this function.
+	if !overlay.Governor.WorkSource.IsZero() {
+		cfg.Governor.WorkSource = overlay.Governor.WorkSource
+	}
 	if len(overlay.RemovedAgents) > 0 {
 		cfg.RemovedAgents = overlay.RemovedAgents
 		cfg.PruneRemovedAgents()
@@ -5324,6 +5347,13 @@ func (c *Config) redactedForPersist() *Config {
 	cp := *c
 	cp.OTel.Headers = envRedactedHeaders(cp.OTel.Headers)
 	cp.Tracing.Headers = envRedactedHeaders(cp.Tracing.Headers)
+	// Work-source credentials: hive.yaml recommends `api_key: ${LINEAR_API_KEY}`,
+	// which Load expands into the real secret in memory. Fold it back into the
+	// ${VAR} reference on persist so the dashboard overlay (and the seed
+	// rewrite) stay secret-free; the worksource factory resolves the reference
+	// again at the point of use.
+	cp.Governor.WorkSource.Linear.APIKey = redactEnvExpandedValue(cp.Governor.WorkSource.Linear.APIKey)
+	cp.Governor.WorkSource.Jira.APIToken = redactEnvExpandedValue(cp.Governor.WorkSource.Jira.APIToken)
 	// #4041: never write the built-in login-pattern defaults as explicit
 	// values. applyDefaults fills LoginPatterns on load, so by save time the
 	// in-memory list always LOOKS explicit; marshaling it pins today's

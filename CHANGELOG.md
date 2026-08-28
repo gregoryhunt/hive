@@ -45,6 +45,26 @@ Hive did not historically maintain a complete changelog. This file starts a prag
 
 ### Fixed
 
+- A work source set from the dashboard (Settings → Governor → Work Source,
+  `PUT /api/config/governor/work-source`) now survives a pod restart on
+  Kubernetes, and a credential written as `${LINEAR_API_KEY}` there actually
+  works. Two bugs, seen together on a standalone hive: the save reached
+  `/data/hive.yaml.dashboard`, but the boot-time reload only adopted
+  OTel/Tracing, removed-agent tombstones and agents from that overlay, so
+  `governor.work_source` was silently dropped and `GET` came back with
+  `type: ""` after every restart; and a value saved through the API is
+  stored verbatim (only file loads are env-expanded), so the Linear adapter
+  sent the literal string `${LINEAR_API_KEY}` as its `Authorization` header
+  and got 401. The reload now adopts the overlay's whole `work_source` block
+  when it is set (the overlay's `variables` block is still deliberately never
+  merged), and the Linear `api_key` / Jira `api_token` resolve a whole-value
+  `${VAR}` or `$VAR` reference from the hive's environment when the work
+  source is built — an unset variable is a clear startup error naming the
+  field and variable, never a literal header. Persisted copies of the config
+  (seed rewrite and overlay) also fold a key that came from the environment
+  back into its `${VAR}` reference, so the overlay stays secret-free. The
+  documented `api_key: ${LINEAR_API_KEY}` form works from both `hive.yaml`
+  and the dashboard.
 - The canonical `blocked` workflow overlay now stays out of the contributor
   queue: the actionable-work enumerator, ReadyQueue, live contributor
   assignment, and internal kick projection all withhold it. Work waiting on

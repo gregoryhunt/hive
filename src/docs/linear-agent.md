@@ -54,15 +54,40 @@ mid-run streaming of agent output into Linear yet.
 2. **Set the environment variables** on the hive (see
    [env-vars.md](env-vars.md#linear-agent-integration)):
    `LINEAR_CLIENT_ID`, `LINEAR_CLIENT_SECRET`, `LINEAR_WEBHOOK_SECRET`.
-3. **Connect the workspace**: as an owner, `POST /api/linear/agent/install`
-   returns an `authorize_url`; open it in a browser and approve the app for
-   the workspace (the flow uses `actor=app` and the
-   `app:assignable,app:mentionable` scopes, so the app becomes an assignable,
-   mentionable workspace member). Linear redirects back to
-   `/linear/callback`, and the hive stores the workspace grant + its
-   per-workspace app user id at `LINEAR_AGENT_STORE`
+3. **Tell the hive its public origin** when the dashboard is not reached at
+   `https://<your-hive>` directly. The `redirect_uri` the hive sends Linear
+   is built from, in order: `dashboard.public_url`, then `hub.dashboard_url`
+   (hub-hosted spokes only), then the request's
+   `X-Forwarded-Proto`/`X-Forwarded-Host`/`Host`. Set the first one on a
+   standalone (`hub.enabled: false`) hive whose dashboard is private but
+   whose `/linear/callback` is published on another hostname, or that sits
+   behind an ingress that rewrites the `Host` header (Traefik with a fixed
+   upstream `Host`, a Cloudflare Tunnel "HTTP Host Header") — otherwise the
+   install request and the callback request derive different origins and
+   Linear refuses the code exchange with `redirect_uri is invalid`:
+
+   ```yaml
+   dashboard:
+     public_url: https://hive.example.com   # origin only: no path or query
+   ```
+
+   It must be an absolute `http(s)://` origin; a path, query, fragment or
+   credentials fail config load with a clear error, and a trailing slash is
+   trimmed. It is honored from the seed config (`hive.yaml`). Do **not** reach
+   for `hub.dashboard_url` on a hub-less hive — it is the hub's notion of the
+   spoke's dashboard link and stays only as the fallback for hub-hosted
+   spokes.
+4. **Connect the workspace**: as an owner, `POST /api/linear/agent/install`
+   returns an `authorize_url` and the `redirect_uri` it was built with — that
+   `redirect_uri` is the exact value the Linear app's Callback URL must match,
+   so check it here rather than decoding the authorize URL. Open the
+   `authorize_url` in a browser and approve the app for the workspace (the
+   flow uses `actor=app` and the `app:assignable,app:mentionable` scopes, so
+   the app becomes an assignable, mentionable workspace member). Linear
+   redirects back to `/linear/callback`, and the hive stores the workspace
+   grant + its per-workspace app user id at `LINEAR_AGENT_STORE`
    (default `/data/linear-agent.json`).
-4. **Pick the session agent** in `hive.yaml` when the hive runs more than one
+5. **Pick the session agent** in `hive.yaml` when the hive runs more than one
    agent:
 
    ```yaml
@@ -73,7 +98,7 @@ mid-run streaming of agent output into Linear yet.
    ```
 
    With exactly one configured agent this is implicit.
-5. **Optional — enumerate only delegated/assigned issues**: when the Linear
+6. **Optional — enumerate only delegated/assigned issues**: when the Linear
    work source is active, `assigned_only: true` narrows backlog enumeration to
    issues assigned **or delegated** to the app user (Linear sets `delegate`,
    not `assignee`, when an issue is handed to an agent):

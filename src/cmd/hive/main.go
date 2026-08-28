@@ -1519,6 +1519,19 @@ func main() {
 	archiveOnShutdown := func() { agentMgr.ArchiveAllKickLogs("shutdown") }
 	preShutdownHook.Store(&archiveOnShutdown)
 	agentMgr.SetSandboxConfig(cfg.AgentSandbox)
+
+	// Say out loud when the sandbox opt-in is configured but inert. The gate is
+	// two-part (global agent_sandbox.enabled AND a per-agent sandbox.enabled),
+	// and the dashboard's Security tab writes only the global half — so an
+	// owner can turn the sandbox on, be told the setting was updated, and still
+	// have every agent running unconfined on the operator's own host.
+	//
+	// That silence is the part of #4918 that is safe to fix here. The gate
+	// itself is load-bearing: a sandboxed agent runs a different execution
+	// model and startSandboxKickLocked has no tmux fallback, so collapsing it
+	// would convert working agents into permanently failing ones. Telling an
+	// operator who believes they are covered that they are not costs nothing.
+	logAgentSandboxPosture(logger, cfg)
 	// Treat any configured gateway name as an inference-routable backend so an
 	// agent with backend: <gateway> routes through it. Resolution is live
 	// (reads cfg on each call) so gateways added from the Model Gateways tab
@@ -2824,7 +2837,7 @@ func main() {
 	// The loop therefore runs for the lifetime of the process (it does NOT
 	// return after the first success) and, whenever the banner is currently
 	// showing, re-runs the SAME read+write verification as the manual "Re-check"
-	// button (githubAppRecheckFn, which calls diagnoseGitHubAppWrite) and clears
+	// button (githubAppRecheckFn, which calls diagnoseGitHubApp) and clears
 	// the flag on success. When the banner is not showing there is nothing to do,
 	// so the tick is a cheap no-op that makes no GitHub API calls.
 	{
@@ -3002,6 +3015,11 @@ func main() {
 		// threshold — re-sync it alongside the repo list above.
 		gov.SetRepoCount(cfg.Project.RepoCount())
 		agentMgr.SetSandboxConfig(cfg.AgentSandbox)
+		// Re-run the posture check on reload, not only at boot: flipping the
+		// Security tab's sandbox toggle writes the config and lands here, which
+		// is the exact moment an operator forms the belief that they are now
+		// sandboxed. See logAgentSandboxPosture.
+		logAgentSandboxPosture(logger, cfg)
 
 		// Hot-reload the state-triggered hooks (RFC #4001). Recompiles only
 		// when the `hooks:` list actually changed, and swaps the registry in
@@ -5187,14 +5205,8 @@ func (s labelPlanSink) QueuedPlan(epic *beads.Bead, paused bool) {
 	s.logger.Warn("plan-from-label: architect unavailable, plan queued", "epic", epic.ID, "ref", epic.ExternalRef)
 }
 
-// diagnoseGitHubAppWrite returns "" when the configured GitHub App
-// installation belongs to expectedOwner and grants issues:write. Otherwise it
-// returns a banner-ready diagnosis distinguishing the two write-failure causes
-// that produce identical 403s: an installation_id pointing at a different
-// org's installation, and a permission update the org owner hasn't approved
-// yet. A nil appAuth (token-authenticated hive) yields "" — nothing to check.
 // healGitHubAppInstallation self-heals a hive whose github.installation_id
-// points at the WRONG account — the failure mode diagnoseGitHubAppWrite
+// points at the WRONG account — the failure mode diagnoseGitHubApp
 // already detects and reports ("installation N belongs to 'X', not 'Y'"). It
 // asks pkg/github to rediscover the installation covering cfg.Project.Org via
 // the App JWT and, only on an unambiguous match, adopts it in place and
@@ -5268,13 +5280,6 @@ func diagnoseGitHubAppFull(ctx context.Context, appAuth *github.AppAuth, expecte
 		return github.AppAuthDiagnosis{State: github.AppStateOK, ExpectedAccount: expectedOwner}
 	}
 	return appAuth.DiagnoseAppAuth(ctx, expectedOwner, spokeAppKeyPath, spokeProvisionedAppKeyPath)
-}
-
-// diagnoseGitHubAppWrite is the string-only wrapper retained for callers that
-// only need banner copy.
-func diagnoseGitHubAppWrite(ctx context.Context, appAuth *github.AppAuth, expectedOwner string) string {
-	msg, _ := diagnoseGitHubApp(ctx, appAuth, expectedOwner)
-	return msg
 }
 
 // maxTimelineEnumeratePerCycle bounds how many enumerated-issue events a single
@@ -5701,6 +5706,36 @@ func advisoryIssueMissingError(repo string, cause error) string {
 	return base
 }
 
+// actionableAfterGitHubEnumerate decides whether an eval cycle survives a
+// failed GitHub enumeration. On the default (GitHub) work source the answer
+// is no: an all-repos failure usually means a rate limit or outage, and a
+// zero-count result would idle the agents, so the cycle keeps prior state.
+//
+// On a non-default work source (e.g. Linear) the GitHub call is only there
+// for PR maintenance; the backlog comes from the work-source overlay that
+// runs next. Aborting here meant a Linear-sourced hive whose GitHub App could
+// not list issues (403 "Resource not accessible by integration", an Issues
+// permission a Linear hive should not need) never enumerated its Linear
+// backlog at all and sat at queue 0. Such a hive continues with whatever
+// partial result GitHub returned (nil becomes an empty result; PRs are kept
+// when obtainable) and lets the overlay populate issues.
+func actionableAfterGitHubEnumerate(cfg *config.Config, actionable *github.ActionableResult, err error, logger *slog.Logger) (*github.ActionableResult, bool) {
+	if err == nil {
+		return actionable, true
+	}
+	wsType := cfg.Governor.WorkSource.Type
+	if wsType == "" || wsType == "github" {
+		logger.Error("failed to enumerate actionable items", "error", err)
+		return nil, false
+	}
+	logger.Warn("GitHub enumeration failed; continuing so the configured work source can still populate issues",
+		"work_source", wsType, "error", err)
+	if actionable == nil {
+		actionable = &github.ActionableResult{GeneratedAt: time.Now()}
+	}
+	return actionable, true
+}
+
 func runEvalCycle(
 	ctx context.Context,
 	cfg *config.Config,
@@ -5770,8 +5805,8 @@ func runEvalCycle(
 	enumCtx, enumSpan := tracing.StartSpan(ctx, "governor.enumerate_actionable")
 	actionable, err := ghClient.EnumerateActionable(enumCtx)
 	enumSpan.End()
-	if err != nil {
-		logger.Error("failed to enumerate actionable items", "error", err)
+	actionable, ok := actionableAfterGitHubEnumerate(cfg, actionable, err, logger)
+	if !ok {
 		return
 	}
 
@@ -6359,7 +6394,15 @@ func runEvalCycle(
 		// forced full rewrite stretches with this interval (60 attempts ×
 		// interval) — acceptable, since it only heals out-of-band comment
 		// edits, and documented in the settings tooltip.
-		if shouldPostAdvisoryDigest(digest, ghClient, hasExistingPinnedIssueForEmptyDigest) &&
+		// governor.advisory.target routes the comment write: GitHub (default,
+		// the unchanged path below) or a designated Linear issue. For the
+		// Linear route the configured issue plays the pinned issue's role in
+		// the empty-digest freshness rule, so a clean Linear-sourced hive
+		// keeps refreshing its comment exactly as a GitHub one does.
+		advisoryTarget, advisoryLinearIssue, advisoryRouteErr := resolveAdvisoryDigestRoute(cfg)
+		hasDigestHome := hasExistingPinnedIssueForEmptyDigest ||
+			(advisoryTarget == config.AdvisoryTargetLinear && advisoryRouteErr == nil)
+		if shouldPostAdvisoryDigest(digest, ghClient, hasDigestHome) &&
 			advisoryPostDue(advCfg, primaryRepo, time.Now(), logger) {
 			// Log severity breakdown and contributing agents
 			bySeverity := map[string]int{"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
@@ -6392,7 +6435,26 @@ func runEvalCycle(
 				PrimaryRepo: repoName,
 			})
 			if md != "" {
-				if hasPinnedAdvisoryIssue {
+				if advisoryTarget != config.AdvisoryTargetGitHub {
+					// Non-GitHub route. A misconfiguration (Linear chosen with
+					// no linear_issue, or an unknown target) is recorded as a
+					// post FAILURE, never redirected to the GitHub issue: the
+					// operator opted out of it, and the hub's staleness pill is
+					// how they learn the digest has nowhere to go.
+					if advisoryRouteErr != nil {
+						dashSrv.RecordAdvisoryError(advisoryRouteErr.Error())
+						logger.Error("advisory digest not posted: target misconfigured",
+							"target", advisoryTarget, "error", advisoryRouteErr)
+					} else if err := postAdvisoryDigestToLinear(ctx, cfg, advisoryLinearIssue, md); err != nil {
+						dashSrv.RecordAdvisoryError(err.Error())
+						logger.Warn("failed to post advisory digest to linear", "issue", advisoryLinearIssue, "error", err)
+					} else {
+						logger.Info("posted advisory digest", "linear_issue", advisoryLinearIssue, "findings", digest.TotalCount, "via", "linear")
+						dashSrv.RecordAdvisoryPost(digest.TotalCount)
+						recordAdvisoryPostSuccess(primaryRepo, time.Now())
+						dashSrv.RecordAdvisoryOverflow(digest.OverflowCount)
+					}
+				} else if hasPinnedAdvisoryIssue {
 					// Prefer the App client as the PRIMARY poster. The App
 					// authored the advisory-digest comment and always holds
 					// issues:write, so it is the correct identity to edit it.
@@ -6872,6 +6934,41 @@ func watchdogAuthProbes(cfg *config.Config) map[string]watchdog.AuthProbe {
 	return out
 }
 
+// turnLossToSnapshot converts the manager's in-memory turn-loss accumulation
+// into its persisted form, or nil when nothing has been recorded.
+//
+// Nil rather than a zero struct on purpose: `turn_loss` is omitempty, so an
+// agent that has never been interrupted adds nothing to /data/hive-state.json.
+// The overwhelming majority of agents are in that state, and a measurement that
+// bloated every hive's state file with empty records would be its own argument
+// for removing it.
+func turnLossToSnapshot(loss agent.TurnLoss) *snapshot.AgentTurnLoss {
+	if loss.Interruptions == 0 && len(loss.Recent) == 0 {
+		return nil
+	}
+	out := &snapshot.AgentTurnLoss{
+		Interruptions: loss.Interruptions,
+		Producing:     loss.Producing,
+		UpperBoundS:   loss.UpperBound.Seconds(),
+		Bytes:         loss.Bytes,
+	}
+	for _, r := range loss.Recent {
+		rec := snapshot.AgentTurnInterruption{
+			At:         r.At,
+			Reason:     r.Reason,
+			SinceKickS: r.SinceKick.Seconds(),
+			Producing:  r.Producing,
+			Bytes:      r.Bytes,
+		}
+		if r.SinceOutput != nil {
+			s := r.SinceOutput.Seconds()
+			rec.SinceOutputS = &s
+		}
+		out.Recent = append(out.Recent, rec)
+	}
+	return out
+}
+
 func persistState(agentMgr *agent.Manager, gov *governor.Governor, cfg *config.Config, path string, logger *slog.Logger, dashSrv *dashboard.Server, wd *watchdog.Reconciler) {
 	statuses := agentMgr.AllStatuses()
 	agents := make(map[string]snapshot.AgentState, len(statuses))
@@ -6887,6 +6984,7 @@ func persistState(agentMgr *agent.Manager, gov *governor.Governor, cfg *config.C
 			PausedReason:    proc.PausedReason,
 			PausedTrigger:   proc.PausedTrigger,
 			PausedBy:        proc.PausedBy,
+			TurnLoss:        turnLossToSnapshot(proc.TurnLoss),
 		}
 		if !proc.PausedAt.IsZero() {
 			t := proc.PausedAt
@@ -8589,6 +8687,18 @@ func parseColorInt(color string) int {
 	var result int
 	fmt.Sscanf(color, "%x", &result)
 	return result
+}
+
+// logAgentSandboxPosture emits the sandbox gate diagnostics from
+// config.AgentSandboxGateWarnings at WARN.
+//
+// Split out so boot and the config-watcher reload report identically — an
+// operator who flips the Security tab's sandbox toggle never restarts, so a
+// boot-only check would never reach the person who most needs it.
+func logAgentSandboxPosture(logger *slog.Logger, cfg *config.Config) {
+	for _, warning := range config.AgentSandboxGateWarnings(cfg) {
+		logger.Warn("agent sandbox posture", "warning", warning)
+	}
 }
 
 func runHub(logger *slog.Logger, configPath string) {

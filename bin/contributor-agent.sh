@@ -506,11 +506,15 @@ RELAY_PID=$!
 
 # Launch the CLI in the tmux session
 CMD=$(backend_binary "$AGENT_BACKEND")
-PERM_FLAG=$(backend_perm_flag "$AGENT_BACKEND")
+# _shell variant: PERM_FLAG's only use here is interpolation into the tmux
+# send-keys shell line below, and the claude deny list (#4938) contains (),*
+# — raw, bash dies at the first paren before the CLI starts. The raw
+# backend_perm_flag stays for argv consumers; see backends.conf.
+PERM_FLAG=$(backend_perm_flag_shell "$AGENT_BACKEND")
 MODEL_FLAG=""
 if [[ -n "${AGENT_MODEL:-}" ]]; then
   case "$AGENT_BACKEND" in
-    # amazonq/goose take their model from config/env, not a --model flag.
+    # goose takes its model from config/env, not a --model flag.
     #
     # bob is excluded because --model is actively FATAL, not merely unused:
     # bob auto-selects its own model, and passing one leaves its model config
@@ -518,7 +522,7 @@ if [[ -n "${AGENT_MODEL:-}" ]]; then
     # "🛑 Cannot read properties of undefined (reading 'maxTokens')".
     # Verified against bobshell 1.0.6. PR #2249 removed it hub-side; this is
     # the same fix on the contributor-relay path.
-    amazonq|goose|bob) ;;
+    goose|bob) ;;
     *) MODEL_FLAG="--model $AGENT_MODEL" ;;
   esac
 fi

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/kubestellar/hive/pkg/auth"
+	"github.com/kubestellar/hive/pkg/delegation"
 	"github.com/kubestellar/hive/pkg/openrouter"
 	"github.com/kubestellar/hive/pkg/reach"
 	"github.com/kubestellar/hive/pkg/tracing"
@@ -880,8 +881,9 @@ type HubServer struct {
 	//
 	// GUARDED BY keyGenerationsMu. The admin rotate endpoint replaces this
 	// pointer while heartbeat and cookie verifiers are concurrently reading it,
-	// so every access goes through currentGenerations() / setGenerations()
-	// rather than touching the field. The field itself is only ever REPLACED,
+	// so every read goes through currentGenerations() rather than touching the
+	// field, and every write holds keyGenerationsMu for the duration of its
+	// evaluate-persist-install sequence. The field itself is only ever REPLACED,
 	// never mutated in place — generationSet.rotate is pure and returns a new
 	// set — so a reader that grabbed the old pointer keeps a consistent,
 	// immutable snapshot and simply verifies against the pre-rotation set for
@@ -973,6 +975,20 @@ type HubServer struct {
 	// Key: hive ID, value: target SHA.  Cleared when the spoke reports the
 	// target SHA, proving the upgrade completed.
 	heartbeatUpgrade map[string]string
+
+	// uncollectibleUpgradeNoted de-duplicates the timeline entry written when
+	// the hub declines to arm an upgrade a hive cannot collect. Key: hive ID,
+	// value: the target the refusal was last reported for, so a genuinely new
+	// upgrade opportunity is reported again while the same refusal is not
+	// repeated every 2-minute poll. See pullonly_upgrade.go.
+	//
+	// PER-SERVER, not a package global: two hubs in one process would otherwise
+	// share and clobber this, letting one server's arming suppress a refusal the
+	// other should have reported. Guarded by its own mutex rather than s.mu
+	// because noteUncollectibleUpgrade is called from paths that do not hold
+	// s.mu and goes on to call recordTimeline.
+	uncollectibleUpgradeMu    sync.Mutex
+	uncollectibleUpgradeNoted map[string]string
 
 	// clusterUnreachableUntil suppresses kubectl against clusters the hub has
 	// just proven it cannot route to (firewalled GPU clusters like the heartbeat-only cluster).
@@ -1452,6 +1468,15 @@ func NewHubServer(port int, logger *slog.Logger, gitHash, gitBranch string) *Hub
 	s.mux.HandleFunc("GET /api/hub/stats", s.handleStats)
 	s.mux.HandleFunc("GET /api/fleet-stats", s.handleFleetStats)
 	s.mux.HandleFunc("GET /api/hub/version", s.handleHubVersion)
+	// Delegation-chain verification material (JWKS-equivalent). Registered
+	// WITHOUT requireAuth on purpose: the whole point of a verifiable chain is
+	// that a TENANT — or an auditor they delegate to, holding no hive
+	// credential at all — can check it without asking the operator to vouch for
+	// it. The response is Ed25519 PUBLIC keys plus generation numbers, both
+	// already non-secret in this codebase (a generation ID names a key; it is
+	// not a key), so there is nothing here for auth to protect. Observe-only:
+	// no hub decision reads a chain. See src/docs/delegation-chain.md.
+	s.mux.HandleFunc("GET "+delegation.KeysPath, s.handleDelegationKeys)
 	s.mux.HandleFunc("DELETE /api/hub/registry/{id}", s.handleRegistryDelete)
 	s.mux.HandleFunc("POST /api/contribute/register", s.handleContributeProxy)
 	s.mux.HandleFunc("GET /api/contribute/status", s.handleContributeStatus)
@@ -3522,6 +3547,10 @@ func (s *HubServer) handleFleetStats(w http.ResponseWriter, r *http.Request) {
 // would reappear in "My Hives" — the in-memory removal alone is not durable.
 // Deletion is rare and user-initiated, so paying the write cost inline is fine.
 func (s *HubServer) removeRegistryEntry(id, by string) {
+	// The hive is going away, so its uncollectible-upgrade de-dup entry must go
+	// with it. An uncollectible hive is by definition never armed, so this is
+	// the ONLY path that can ever retire its entry (see forgetUncollectibleUpgrade).
+	s.forgetUncollectibleUpgrade(id)
 	s.mu.Lock()
 	removed := false
 	for i, h := range s.registry.Hives {
@@ -3585,6 +3614,7 @@ func (s *HubServer) handleRegistryDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	id := r.PathValue("id")
+	s.forgetUncollectibleUpgrade(id)
 	s.mu.Lock()
 	removed := false
 	for i, h := range s.registry.Hives {
@@ -3762,6 +3792,7 @@ func (s *HubServer) recoverArmedUpgrades() {
 	type armed struct{ id, target string }
 	var recovered []armed
 	stamped := 0
+	skippedUncollectible := 0
 	s.mu.Lock()
 	if s.heartbeatUpgrade == nil {
 		s.heartbeatUpgrade = make(map[string]string)
@@ -3793,6 +3824,17 @@ func (s *HubServer) recoverArmedUpgrades() {
 		if h.UpgradeFailed {
 			continue
 		}
+		// Do not re-arm an instruction this hive cannot collect. Startup
+		// recovery reads the DURABLE registry latch, so an uncollectible
+		// upgrade abandoned in memory by triggerAutoUpgrades() would be
+		// resurrected by the next hub restart if the latch had not yet been
+		// persisted — restoring the wedge across exactly the event (a hub
+		// roll) that this function exists to survive. Same predicate as every
+		// other arming site.
+		if !upgradeCollectible(h.LastHeartbeat, time.Now()) {
+			skippedUncollectible++
+			continue
+		}
 		s.heartbeatUpgrade[h.ID] = h.UpgradeTarget
 		recovered = append(recovered, armed{id: h.ID, target: h.UpgradeTarget})
 	}
@@ -3802,6 +3844,10 @@ func (s *HubServer) recoverArmedUpgrades() {
 		// before saveLoop starts is not lost) — otherwise a crash-looping hub
 		// would re-stamp them to now on every restart.
 		s.requestSave()
+	}
+	if skippedUncollectible > 0 {
+		s.logger.Info("skipped recovering armed upgrades for hives that cannot collect them",
+			"count", skippedUncollectible)
 	}
 	for _, a := range recovered {
 		s.logger.Info("recovered armed upgrade from registry after restart",

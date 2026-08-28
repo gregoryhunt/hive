@@ -458,64 +458,65 @@ func (s *LinearSource) fetchTeamIssues(ctx context.Context, teamKey string, stat
 }
 
 func (s *LinearSource) doQuery(ctx context.Context, query string, vars map[string]interface{}) (*linearGraphQLResponse, error) {
-	var resp linearGraphQLResponse
-	if err := s.doGraphQL(ctx, query, vars, &resp); err != nil {
+	raw, err := linearGraphQL(ctx, s.client, s.cfg.BaseURL, s.cfg.APIKey, query, vars)
+	if err != nil {
 		return nil, err
+	}
+	var resp linearGraphQLResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	return &resp, nil
 }
 
-// linearGraphQLErrors is the envelope every Linear response may carry; the
-// typed response structs embed it so doGraphQL can surface the first error
-// regardless of which operation was sent.
-type linearGraphQLErrors struct {
-	Errors []struct {
-		Message string `json:"message"`
-	} `json:"errors"`
-}
-
-// doGraphQL posts one GraphQL operation and decodes the response envelope
-// into out, which must be a pointer to a struct with an `errors` field (any
-// of the linear*Response types). It is the single seam every Linear call —
-// the issue enumeration and issueCreate alike — goes through, so auth and
-// the endpoint override live in exactly one place.
-func (s *LinearSource) doGraphQL(ctx context.Context, query string, vars map[string]interface{}, out interface{}) error {
-	baseURL := s.cfg.BaseURL
+// linearGraphQL posts one GraphQL request to Linear with the bare API-key
+// Authorization header Linear expects and returns the raw response body once
+// it has passed the HTTP-status and top-level `errors` checks. Shared by the
+// issue enumerator (doQuery) and the advisory digest poster so both speak to
+// Linear the same way. An empty baseURL means the production endpoint.
+func linearGraphQL(ctx context.Context, client *http.Client, baseURL, apiKey, query string, vars map[string]interface{}) ([]byte, error) {
 	if baseURL == "" {
 		baseURL = defaultLinearBaseURL
 	}
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
 	body, err := json.Marshal(linearGraphQLRequest{Query: query, Variables: vars})
 	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
+		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", s.cfg.APIKey)
+	req.Header.Set("Authorization", apiKey)
 
-	httpResp, err := s.client.Do(req)
+	httpResp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("post: %w", err)
+		return nil, fmt.Errorf("post: %w", err)
 	}
 	defer httpResp.Body.Close()
 
 	raw, err := io.ReadAll(io.LimitReader(httpResp.Body, 16<<20))
 	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+		return nil, fmt.Errorf("read response: %w", err)
 	}
 	if httpResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status %d: %s", httpResp.StatusCode, string(raw))
+		return nil, fmt.Errorf("status %d: %s", httpResp.StatusCode, string(raw))
 	}
-	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+	var envelope struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
 	}
-	var envelope linearGraphQLErrors
-	if err := json.Unmarshal(raw, &envelope); err == nil && len(envelope.Errors) > 0 {
-		return fmt.Errorf("graphql error: %s", envelope.Errors[0].Message)
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
 	}
-	return nil
+	if len(envelope.Errors) > 0 {
+		return nil, fmt.Errorf("graphql error: %s", envelope.Errors[0].Message)
+	}
+	return raw, nil
 }
 
 // TeamForRepo picks the Linear team that owns work for repo: the first
@@ -557,7 +558,6 @@ const linearIssueCreateMutation = `mutation($input: IssueCreateInput!) {
 }`
 
 type linearTeamIDResponse struct {
-	linearGraphQLErrors
 	Data struct {
 		Teams struct {
 			Nodes []struct {
@@ -569,7 +569,6 @@ type linearTeamIDResponse struct {
 }
 
 type linearIssueCreateResponse struct {
-	linearGraphQLErrors
 	Data struct {
 		IssueCreate struct {
 			Success bool               `json:"success"`
@@ -588,18 +587,23 @@ type LinearCreatedIssue struct {
 }
 
 // CreateIssue files a new issue on the team with key teamKey via Linear's
-// issueCreate mutation. It is the write counterpart of ListIssues and uses
-// the same credential and endpoint. The description is Markdown, which
-// Linear renders natively, so callers can pass the same body they would
-// give GitHub.
+// issueCreate mutation. It is the write counterpart of ListIssues and goes
+// through the same linearGraphQL transport (credential, endpoint, error
+// envelope) as the enumerator and the advisory digest poster. The
+// description is Markdown, which Linear renders natively, so callers can
+// pass the same body they would give GitHub.
 func (s *LinearSource) CreateIssue(ctx context.Context, teamKey, title, description string) (*LinearCreatedIssue, error) {
 	teamKey = strings.TrimSpace(teamKey)
 	if teamKey == "" {
 		return nil, fmt.Errorf("linear: team key is required")
 	}
-	var teamResp linearTeamIDResponse
-	if err := s.doGraphQL(ctx, linearTeamIDQuery, map[string]interface{}{"key": teamKey}, &teamResp); err != nil {
+	raw, err := linearGraphQL(ctx, s.client, s.cfg.BaseURL, s.cfg.APIKey, linearTeamIDQuery, map[string]interface{}{"key": teamKey})
+	if err != nil {
 		return nil, fmt.Errorf("linear: resolve team %s: %w", teamKey, err)
+	}
+	var teamResp linearTeamIDResponse
+	if err := json.Unmarshal(raw, &teamResp); err != nil {
+		return nil, fmt.Errorf("linear: resolve team %s: decode response: %w", teamKey, err)
 	}
 	if len(teamResp.Data.Teams.Nodes) == 0 {
 		return nil, fmt.Errorf("linear: team %q not found", teamKey)
@@ -609,9 +613,13 @@ func (s *LinearSource) CreateIssue(ctx context.Context, teamKey, title, descript
 		"title":       title,
 		"description": description,
 	}
-	var resp linearIssueCreateResponse
-	if err := s.doGraphQL(ctx, linearIssueCreateMutation, map[string]interface{}{"input": input}, &resp); err != nil {
+	raw, err = linearGraphQL(ctx, s.client, s.cfg.BaseURL, s.cfg.APIKey, linearIssueCreateMutation, map[string]interface{}{"input": input})
+	if err != nil {
 		return nil, fmt.Errorf("linear: issueCreate: %w", err)
+	}
+	var resp linearIssueCreateResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("linear: issueCreate: decode response: %w", err)
 	}
 	if !resp.Data.IssueCreate.Success || resp.Data.IssueCreate.Issue.Identifier == "" {
 		return nil, fmt.Errorf("linear: issueCreate did not return an issue")

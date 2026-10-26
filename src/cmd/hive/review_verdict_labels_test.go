@@ -126,7 +126,7 @@ func TestSweepClosedPRVerdictLabels(t *testing.T) {
 
 	sweepClosedPRVerdictLabels(context.Background(), cfg, labeler, now, nil)
 
-	if got := strings.Join(labeler.removed, "|"); got != "acme/a#2331 hive-review/in-progress|ACME/a#2320 hive-review/approved" {
+	if got := strings.Join(labeler.removed, "|"); got != "acme/a#2331 hive-review/in-progress|acme/a#2320 hive-review/approved" {
 		t.Fatalf("removed = %q, want only the governed repo's closed PRs", got)
 	}
 	if len(labeler.applied) != 0 {

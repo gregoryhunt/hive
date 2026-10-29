@@ -75,10 +75,14 @@
         // names who moves it next (hivecommons/hive#15094).
         const openNew = n === 0 && state === 'active' && !openHold && !openBlocked && !openDraft && typeof stageTrackerNewState === 'function' && !!stageTrackerNewState(item);
         const advisory = n === 0 && state === 'active' && !openHold && !openBlocked && typeof stageTrackerAdvisoryOf === 'function' ? stageTrackerAdvisoryOf(item) : null;
+        // An issue waiting on a maintainer's triage says so in the column
+        // (hivecommons/hive#15437 read "New" while the caption held the ask).
+        const openTriage = n === 0 && state === 'active' && !openHold && !openBlocked && !openDraft && !advisory && typeof stageTrackerOpenTriageNeeded === 'function' && stageTrackerOpenTriageNeeded(item);
         if (openHold) word = 'Open · hold';
         else if (openBlocked) word = 'Open · blocked';
         else if (advisory) word = advisory.chip || 'Advisory · read & close';
         else if (openDraft) word = 'Draft';
+        else if (openTriage) word = 'Triage needed';
         else if (openNew) word = 'New';
         // A plain, blocked or draft Open step (no stage label, not held)
         // says how long it has sat there, from the same instant the since
@@ -240,6 +244,20 @@
       if (!item || (Number(item.stage) || 0) !== 0 || !item.new || typeof item.new !== 'object') return null;
       return item.new;
     }
+    // Pure: an issue in the Open column that waits on a maintainer's triage
+    // — the needs-triage pill, or a 000-new reporter-trust hold whose next
+    // mover is the maintainer (triage gate next) before the awaiting label
+    // has landed. The chevron then says "Triage needed", not "New": the ask
+    // is in the column, not only in the caption.
+    function stageTrackerOpenTriageNeeded(item) {
+      if (!item || item.kind === 'pr' || (Number(item.stage) || 0) !== 0) return false;
+      const mods = Array.isArray(item.modifiers) ? item.modifiers : [];
+      if (mods.indexOf('needs-triage') >= 0) return true;
+      const fresh = stageTrackerNewState(item);
+      if (!fresh || fresh.next_mover !== 'maintainer') return false;
+      const gates = Array.isArray(fresh.gates) ? fresh.gates : [];
+      return gates.some(g => g && g.name === 'triage' && g.state === 'next');
+    }
     // "Next: …" and "Gates ahead: triage ✓ → actionable → claimed" for the
     // row tooltip and the lit chevron. nowMs refreshes the next-pass countdown.
     function stageTrackerNewLines(item, nowMs) {
@@ -334,7 +352,7 @@
           tip = sg.label + (sg.description ? ' — ' + sg.description : '');
           if (sg.blocked) tip += ' — ' + stageTrackerBlockedTip(item);
           if (sg.draft) tip += ' — ' + STAGE_TRACKER_DRAFT_TIP;
-          if (sg.isNew && typeof stageTrackerNewLines === 'function') tip = 'New — ' + stageTrackerNewLines(item, nowMs).join(' — ');
+          if (sg.isNew && typeof stageTrackerNewLines === 'function') tip = (typeof stageTrackerOpenTriageNeeded === 'function' && stageTrackerOpenTriageNeeded(item) ? 'Triage needed — ' : 'New — ') + stageTrackerNewLines(item, nowMs).join(' — ');
           if (sg.advisory) tip = (item.advisory && item.advisory.caption) || 'Advisory for maintainers · read, then close';
           if (sg.openSince) tip += ' — open since ' + new Date(sg.openSince.ms).toISOString() + (sg.openSince.fromCreated ? ' (opened)' : '');
           // The shared Merge gate word hides 080 vs 095 vs 100; the chevron tooltip carries it.
@@ -987,6 +1005,10 @@
       ctx.nowMs = typeof nowMs === 'number' ? nowMs : Date.now();
       return stageTrackerLeadActionHtml(item, ctx);
     }
+    // PR link, then the lineage chip (null = none), then the base pill.
+    function stageTrackerPRPillsHtml(ref, lineage, baseRef) {
+      return ref + (lineage == null ? '' : ' ' + lineage) + (baseRef ? ` <span class="ham-badge">${esc(baseRef)}</span>` : '');
+    }
     function stageTrackerSubRowHtml(lp, issue, stages, nowMs, ctx) {
       const pr = stageTrackerLinkedPRItem(issue, lp);
       const superseded = typeof stageTrackerLinkedSupersededText === 'function' ? stageTrackerLinkedSupersededText(lp, issue) : '';
@@ -998,8 +1020,7 @@
       const lineage = superseded ? '' : ((typeof stageTrackerLineageChipHtml === 'function' ? stageTrackerLineageChipHtml(pr, nowMs) : '') || (typeof stageTrackerAdoptedFromChipHtml === 'function' ? stageTrackerAdoptedFromChipHtml(pr, nowMs) : ''));
       const chip = ctx && ctx.repoChips ? stageTrackerRepoChipHtml(pr.repo, ctx) : '';
       if (chip) ref = `<span class="ham-pr-line">${chip}${ref}</span>`;
-      if (lineage) ref += ' ' + lineage;
-      if (lp.base_ref) ref += ` <span class="ham-badge">${esc(lp.base_ref)}</span>`;
+      ref = stageTrackerPRPillsHtml(ref, lineage || null, lp.base_ref);
       ref = STAGE_TRACKER_LINKED_GLYPH + ref;
       if (superseded) {
         // The adopted original: one dimmed line, no chevron track, no row
@@ -1222,7 +1243,7 @@
           // One covering PR: a single entry whose strip the PR's stage drives.
           const lp = linked[0];
           const who = (lp.author_kind || 'hive') + (lp.author ? ' · @' + lp.author : '');
-          prRefs = [STAGE_TRACKER_LINKED_GLYPH + stageTrackerPRRef(lp.number, lp.url, lp.author_kind || '', lp.author, lp.title, (lp.title ? lp.title + '\n' : '') + 'Author: ' + who + ' · ' + stageTrackerLinkedTip(item, lp.number, ctx)) + (lp.lineage && typeof stageTrackerLineageChipHtml === 'function' ? ' ' + stageTrackerLineageChipHtml(lp, nowMs) : '') + (lp.base_ref ? ` <span class="ham-badge">${esc(lp.base_ref)}</span>` : '')];
+          prRefs = [STAGE_TRACKER_LINKED_GLYPH + stageTrackerPRPillsHtml(stageTrackerPRRef(lp.number, lp.url, lp.author_kind || '', lp.author, lp.title, (lp.title ? lp.title + '\n' : '') + 'Author: ' + who + ' · ' + stageTrackerLinkedTip(item, lp.number, ctx)), lp.lineage && typeof stageTrackerLineageChipHtml === 'function' ? stageTrackerLineageChipHtml(lp, nowMs) : null, lp.base_ref)];
           shown = Object.assign({}, item, { via_pr: true, stage: lp.stage || 40, stage_since: lp.stage_since || item.stage_since, modifiers: lp.modifiers || item.modifiers, deferred_modifiers: lp.deferred_modifiers || item.deferred_modifiers || [], caption: lp.caption || item.caption, reason: lp.reason || item.reason,
             human_approver: lp.human_approver || '', manual_merge: !!lp.manual_merge, human_merge_reason: lp.human_merge_reason || '', human_merge_reason_text: lp.human_merge_reason_text || '', sentinel_alert: !!lp.sentinel_alert, sentinel_reason: lp.sentinel_reason || '', head: lp.head || '', decision_needed: lp.decision_needed || null, hold: lp.hold || null, adoption: lp.adoption || null, stage_actor: lp.stage_actor || item.stage_actor || null, claimant: lp.claimant || null, presence: lp.presence || null, rework: lp.rework || null, merge_gate: lp.merge_gate || null, merge_train: lp.merge_train || null, decided: lp.decided || item.decided || null });
         } else if (linked.length) {

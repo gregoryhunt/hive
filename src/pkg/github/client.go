@@ -795,6 +795,9 @@ type Issue struct {
 	// stage/030-pr-in-progress from stage/020-claimed; the claim's kind
 	// alone never does (hivecommons/hive#13069).
 	ClaimPRStarted bool `json:"claim_pr_started,omitempty"`
+	// ClaimHive is the marker's hive= — the hive that recorded the live
+	// claim — when the claim came from a `hive:claim` marker; empty otherwise.
+	ClaimHive string `json:"claim_hive,omitempty"`
 	// ClaimAdvisory is set when the issue carries a live contributor claim
 	// the live-claim filter chose NOT to honour — the issue is in contributor
 	// cool-off, or contributor claims have kept hive agents off it past the
@@ -1766,11 +1769,11 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 		switch standingMetaIssueKindFor(issue.GetTitle(), safeGetLogin(issue.GetUser()), labels) {
 		case standingMetaHiveAdvisory:
 			breakdown.HiveAdvisory++
-			details = append(details, repoWorkIssue(repo, issue, labels, "hive_advisory", "Hive advisory report"))
+			details = append(details, c.workIssue(repo, issue, labels, "hive_advisory", "Hive advisory report"))
 			continue
 		case standingMetaDependencyDashboard:
 			breakdown.DependencyDashboard++
-			details = append(details, repoWorkIssue(repo, issue, labels, "dependency_dashboard", "Dependency dashboard control panel"))
+			details = append(details, c.workIssue(repo, issue, labels, "dependency_dashboard", "Dependency dashboard control panel"))
 			continue
 		}
 
@@ -1802,7 +1805,7 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 		if c.isExempt(labels) {
 			breakdown.Filtered++
 			breakdown.Exempt++
-			details = append(details, repoWorkIssue(repo, issue, labels, "filtered", "Exempt label"))
+			details = append(details, c.workIssue(repo, issue, labels, "filtered", "Exempt label"))
 			continue
 		}
 		// A tracking/archive issue (hive/tracking label, hive:tracking
@@ -1812,7 +1815,7 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 		if _, tracking := isTrackingIssue(issue); tracking {
 			breakdown.Filtered++
 			breakdown.Tracking++
-			details = append(details, repoWorkIssue(repo, issue, labels, "filtered", trackingFilterReason))
+			details = append(details, c.workIssue(repo, issue, labels, "filtered", trackingFilterReason))
 			continue
 		}
 		// Blocked on an unmerged PR (hivecommons/hive#13093): out of the
@@ -1823,7 +1826,7 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 		if hasBlockedLabel(labels) {
 			breakdown.Filtered++
 			breakdown.Blocked++
-			row := repoWorkIssue(repo, issue, labels, "filtered", blockedFilterReason(issue.GetBody()))
+			row := c.workIssue(repo, issue, labels, "filtered", blockedFilterReason(issue.GetBody()))
 			row.RecheckAfter, row.OpsTracking = blockedRecheck(issue.GetBody())
 			row.RecheckDone = blockedRecheckDone(issue.GetBody())
 			details = append(details, row)
@@ -1832,13 +1835,13 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 		if labelPresent(labels, issueNeedsReporterConfirmationLabel) {
 			breakdown.Filtered++
 			breakdown.ReporterConfirmation++
-			details = append(details, repoWorkIssue(repo, issue, labels, "filtered", issueNeedsReporterConfirmationLabel))
+			details = append(details, c.workIssue(repo, issue, labels, "filtered", issueNeedsReporterConfirmationLabel))
 			continue
 		}
 		if suppress := hardSuppressIssueBucket(issueFilter, labels); suppress != "" {
 			breakdown.Filtered++
 			breakdown.addHardSuppress(suppress)
-			details = append(details, repoWorkIssue(repo, issue, labels, "filtered", suppress))
+			details = append(details, c.workIssue(repo, issue, labels, "filtered", suppress))
 			continue
 		}
 
@@ -1863,7 +1866,7 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 			if !ra.AdmitsReporter(labels, safeGetLogin(issue.GetUser()), issue.GetAuthorAssociation()) {
 				c.markReporterTrustAwaiting(ctx, repo, issue, labels, ra, reporterTrustWaitBudget)
 				breakdown.ReporterTriage++
-				details = append(details, repoWorkIssue(repo, issue, labels, workBucketReporterTriage, reporterTriageAwaitingReason))
+				details = append(details, c.workIssue(repo, issue, labels, workBucketReporterTriage, reporterTriageAwaitingReason))
 				continue
 			}
 			labels = c.clearReporterTrustAwaiting(ctx, repo, issue, labels, ra)
@@ -1871,7 +1874,7 @@ func (c *Client) fetchIssues(ctx context.Context, repo string, now time.Time, re
 
 		if !issueFilter.Admits(labels) {
 			breakdown.Filtered++
-			details = append(details, repoWorkIssue(repo, issue, labels, "filtered", "Project issue filter"))
+			details = append(details, c.workIssue(repo, issue, labels, "filtered", "Project issue filter"))
 			continue
 		}
 
@@ -4595,23 +4598,29 @@ func (c *Client) repoWorkPR(repo string, pr *gh.PullRequest, labels []string, hi
 }
 
 type RepoWorkIssue struct {
-	Repo      string    `json:"repo"`
-	Number    int       `json:"number"`
-	Title     string    `json:"title"`
-	Author    string    `json:"author,omitempty"`
-	Labels    []string  `json:"labels,omitempty"`
-	Assignees []string  `json:"assignees,omitempty"`
-	CreatedAt time.Time `json:"created_at,omitzero"`
-	UpdatedAt time.Time `json:"updated_at,omitzero"`
-	URL       string    `json:"url,omitempty"`
-	Bucket    string    `json:"bucket"`
-	Reason    string    `json:"reason,omitempty"`
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	Title  string `json:"title"`
+	Author string `json:"author,omitempty"`
+	// AuthorIsHuman is Issue.AuthorIsHuman for a sidelined issue, so the
+	// tracker can still classify the reporter of a row parked in a work
+	// bucket (reporter triage, filtered, …) instead of rendering it with an
+	// unknown author kind.
+	AuthorIsHuman bool      `json:"author_is_human,omitempty"`
+	Labels        []string  `json:"labels,omitempty"`
+	Assignees     []string  `json:"assignees,omitempty"`
+	CreatedAt     time.Time `json:"created_at,omitzero"`
+	UpdatedAt     time.Time `json:"updated_at,omitzero"`
+	URL           string    `json:"url,omitempty"`
+	Bucket        string    `json:"bucket"`
+	Reason        string    `json:"reason,omitempty"`
 	// ClaimKind, ClaimedBy and ClaimPRStarted are Issue.ClaimKind /
 	// Issue.ClaimedBy / Issue.ClaimPRStarted, copied for the issue stage
 	// reconciler.
 	ClaimKind      string `json:"claim_kind,omitempty"`
 	ClaimedBy      string `json:"claimed_by,omitempty"`
 	ClaimPRStarted bool   `json:"claim_pr_started,omitempty"`
+	ClaimHive      string `json:"claim_hive,omitempty"`
 	// LinkedPRs and ClaimContext carry the PR-claim evidence of an issue the
 	// duplicate-PR guard suppressed into the claimed_by_pr bucket
 	// (hivecommons/hive#12144), so the repo card can render the same
@@ -4646,6 +4655,7 @@ func repoWorkIssueFromIssue(issue Issue, bucket, reason string) RepoWorkIssue {
 		Number:          issue.Number,
 		Title:           issue.Title,
 		Author:          issue.Author,
+		AuthorIsHuman:   issue.AuthorIsHuman,
 		Labels:          append([]string(nil), issue.Labels...),
 		Assignees:       append([]string(nil), issue.Assignees...),
 		CreatedAt:       issue.CreatedAt,
@@ -4656,6 +4666,7 @@ func repoWorkIssueFromIssue(issue Issue, bucket, reason string) RepoWorkIssue {
 		ClaimKind:       issue.ClaimKind,
 		ClaimedBy:       issue.ClaimedBy,
 		ClaimPRStarted:  issue.ClaimPRStarted,
+		ClaimHive:       issue.ClaimHive,
 		LinkedPRs:       append([]IssueLinkedPR(nil), issue.LinkedPRs...),
 		ClaimContext:    issue.ClaimContext,
 		Children:        issue.Children,
@@ -4675,6 +4686,16 @@ func appendRepoWorkIssueDetail(result *ActionableResult, issue Issue, bucket, re
 	details := result.WorkDetailsByRepo[issue.Repo]
 	details.Issues = append(details.Issues, repoWorkIssueFromIssue(issue, bucket, reason))
 	result.WorkDetailsByRepo[issue.Repo] = details
+}
+
+// workIssue is repoWorkIssue with the client's author classification, so a
+// sidelined issue carries AuthorIsHuman the way an actionable one does.
+func (c *Client) workIssue(repo string, issue *gh.Issue, labels []string, bucket, reason string) RepoWorkIssue {
+	row := repoWorkIssue(repo, issue, labels, bucket, reason)
+	if issue != nil {
+		row.AuthorIsHuman = c.isHumanAuthor(issue.GetUser())
+	}
+	return row
 }
 
 func repoWorkIssue(repo string, issue *gh.Issue, labels []string, bucket, reason string) RepoWorkIssue {

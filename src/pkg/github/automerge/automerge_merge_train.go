@@ -14,6 +14,7 @@ import (
 
 	hgithub "github.com/hivecommons/hive/pkg/github"
 	"github.com/hivecommons/hive/pkg/stageengine/prstage"
+	"github.com/hivecommons/hive/pkg/stagelabels"
 )
 
 // Merge train (hivecommons/hive#15117).
@@ -74,6 +75,16 @@ type RebaseRequest struct {
 // once per PR head.
 type RebaseResolver interface {
 	RequestRebase(ctx context.Context, req RebaseRequest) error
+}
+
+// HotspotRecorder is the merge-hotspot advisor's intake (pkg/hotspot.Store
+// satisfies it through cmd/hive). RecordPRFiles is called once per train
+// candidate per sweep with the files the planner already fetched;
+// RecordConflict once per sibling rebase the train requests, with the
+// files that sibling shares with the front.
+type HotspotRecorder interface {
+	RecordPRFiles(repo string, number int, files []string, openedAt time.Time)
+	RecordConflict(repo string, number int, files []string)
 }
 
 // RebaseResolverFunc adapts a function to RebaseResolver.
@@ -288,6 +299,9 @@ type mergeTrainPlan struct {
 	lane, displayRepo, owner, repo string
 	groups                         []mergeTrainGroup
 	byNumber                       map[int]*mergeTrainGroup
+	// duplicates are the PRs held out of every train this pass because
+	// another open PR fixes the same issue (one PR per issue).
+	duplicates map[int]mergeTrainDuplicateHold
 }
 
 // group returns the train number rides in, if any.
@@ -340,12 +354,17 @@ func (c *Engine) planMergeTrains(ctx context.Context, lane, displayRepo, owner, 
 	if !c.mergeTrainPolicyNow().Enabled || c == nil || c.gh == nil {
 		return plan
 	}
+	prs = c.planDuplicateHolds(plan, owner, repo, displayRepo, prs, prefilter)
 	perBase := map[string][]*gh.PullRequest{}
 	for _, pr := range prs {
 		if pr == nil || pr.GetNumber() <= 0 || pr.GetHead() == nil || pr.GetHead().GetSHA() == "" {
 			continue
 		}
 		if !mergeTrainCandidate(prefilter(pr)) {
+			continue
+		}
+		if c.mergeTrainReturnedToContributor(owner, repo, pr) {
+			c.mergeTrainSkipLogged(owner, repo, displayRepo, pr.GetNumber(), pr.GetHead().GetSHA(), "returned-to-contributor")
 			continue
 		}
 		base := pr.GetBase().GetRef()
@@ -361,6 +380,9 @@ func (c *Engine) planMergeTrains(ctx context.Context, lane, displayRepo, owner, 
 			if err != nil {
 				c.warn("merge train: could not list PR files; left out of the train", "repo", displayRepo, "pr", pr.GetNumber(), "error", err)
 				continue
+			}
+			if c.hotspotRecorder != nil {
+				c.hotspotRecorder.RecordPRFiles(owner+"/"+repo, pr.GetNumber(), files, pr.GetCreatedAt().Time)
 			}
 			members = append(members, mergeTrainMember{
 				Number:         pr.GetNumber(),
@@ -406,6 +428,13 @@ func (c *Engine) planMergeTrains(ctx context.Context, lane, displayRepo, owner, 
 			m.HeadSHA = live.GetHead().GetSHA()
 		}
 	}
+	for i := range members {
+		m := &members[i]
+		if m.Number > 0 && c.mergeTrainConflictOutsider(owner, repo, m.Base, *m) {
+			c.mergeTrainSkipLogged(owner, repo, displayRepo, m.Number, m.HeadSHA, "conflicting")
+			m.Number = 0
+		}
+	}
 	plan.groups = groupMergeTrains(members)
 	for i := range plan.groups {
 		g := &plan.groups[i]
@@ -415,6 +444,55 @@ func (c *Engine) planMergeTrains(ctx context.Context, lane, displayRepo, owner, 
 		c.logMergeTrainTransition(displayRepo, lane, *g)
 	}
 	return plan
+}
+
+// mergeTrainReturnedToContributor reports a PR at stage 072
+// returned-to-contributor (its label, or the stage store's record): the
+// fix is the contributor's, so it never rides a train — hive's own #15307
+// (conflicting, returned) was counted "4 of 6" and drew the train's stall
+// comments (hivecommons/hive#15395).
+func (c *Engine) mergeTrainReturnedToContributor(owner, repo string, pr *gh.PullRequest) bool {
+	if pr == nil {
+		return false
+	}
+	want := stagelabels.ReturnedToContributor.Label()
+	for _, l := range labelNames(pr.Labels) {
+		if strings.EqualFold(strings.TrimSpace(l), want) {
+			return true
+		}
+	}
+	if store := c.stageStoreOrShared(); store != nil {
+		if rec, ok := store.Get(stagelabels.Key(owner+"/"+repo, pr.GetNumber())); ok && rec.Stage == stagelabels.ReturnedToContributor {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeTrainConflictOutsider reports a conflicting member the train must
+// not carry: a PR GitHub says is dirty is admitted only while the train
+// itself is repairing it — a rebase attempt is on record for it behind
+// this base's last merged front and the loop guard is not spent. A PR
+// that arrived conflicting on its own is the author's to fix, and it
+// neither takes a place in the queue nor counts toward the queue's size.
+func (c *Engine) mergeTrainConflictOutsider(owner, repo, base string, m mergeTrainMember) bool {
+	if !mergeTrainDirty(m.MergeableState) {
+		return false
+	}
+	behind := c.mergeTrainLastFront(owner, repo, base)
+	if behind <= 0 || c.rebaseResolver == nil {
+		return true
+	}
+	attempts := c.mergeTrainAttempts(owner, repo, m.Number, behind)
+	return attempts <= 0 || attempts >= c.mergeTrainPolicyNow().MaxRebaseAttempts
+}
+
+// mergeTrainSkipLogged logs one INFO line per head for a PR kept out of
+// every train.
+func (c *Engine) mergeTrainSkipLogged(owner, repo, displayRepo string, number int, headSHA, why string) {
+	if c.markTerminalHoldLogged(owner, repo, number, headSHA, "merge-train-skip:"+why) {
+		c.info("merge train: PR left out of every train", "repo", displayRepo, "pr", number, "why", why)
+	}
 }
 
 // mergeTrainFiles lists a PR's changed paths, cached by head SHA.
@@ -652,12 +730,38 @@ func (c *Engine) mergeTrainRequestSiblingRebase(ctx context.Context, plan *merge
 		return
 	}
 	attempt := c.bumpMergeTrainAttempts(plan.owner, plan.repo, n, front)
+	if c.hotspotRecorder != nil {
+		c.hotspotRecorder.RecordConflict(plan.owner+"/"+plan.repo, n, mergeTrainSharedFiles(g, n))
+	}
 	req := RebaseRequest{Repo: plan.owner + "/" + plan.repo, Number: n, Base: g.Base, Head: live.GetHead().GetRef(), HeadSHA: live.GetHead().GetSHA(), Front: front, Attempt: attempt, MaxAttempts: policy.MaxRebaseAttempts, Lane: plan.lane}
 	if err := c.rebaseResolver.RequestRebase(ctx, req); err != nil {
 		c.warn("merge train: rebase request failed on sibling", "repo", plan.displayRepo, "pr", n, "front", front, "attempt", attempt, "error", err)
 		return
 	}
 	c.info("merge train: rebase requested for sibling after the front merged", "repo", plan.displayRepo, "pr", n, "front", front, "attempt", attempt, "max_attempts", policy.MaxRebaseAttempts)
+}
+
+// mergeTrainSharedFiles returns the overlap files the member itself
+// touches — the paths a conflict on it can be blamed on.
+func mergeTrainSharedFiles(g *mergeTrainGroup, number int) []string {
+	if g == nil {
+		return nil
+	}
+	m, ok := g.members[number]
+	if !ok {
+		return g.OverlapFiles
+	}
+	mine := make(map[string]bool, len(m.Files))
+	for _, f := range m.Files {
+		mine[f] = true
+	}
+	var out []string
+	for _, f := range g.OverlapFiles {
+		if mine[f] {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // mergeTrainSkip is the per-cycle sibling skip: recorded on the stage

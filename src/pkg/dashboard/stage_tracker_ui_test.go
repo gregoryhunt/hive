@@ -140,6 +140,12 @@ func stageTrackerRowsPreludeJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerStageActor"),
 		jsFunc(t, html, "stageTrackerActorKind"),
 		jsFunc(t, html, "stageTrackerActorTip"),
+		jsConstLine(t, html, "STAGE_TRACKER_HIVE_PREFIXES"),
+		jsConstLine(t, html, "STAGE_TRACKER_CLAIMANT_SOURCE"),
+		jsFunc(t, html, "stageTrackerShortHive"),
+		jsFunc(t, html, "stageTrackerClaimant"),
+		jsFunc(t, html, "stageTrackerClaimantShort"),
+		jsFunc(t, html, "stageTrackerClaimantLine"),
 		jsConstLine(t, html, "STAGE_TRACKER_MOTION_STATIC"),
 		jsConstLine(t, html, "STAGE_TRACKER_MOTION_ACTIVE"),
 		jsConstLine(t, html, "STAGE_TRACKER_MOTION_HUMAN"),
@@ -148,6 +154,9 @@ func stageTrackerRowsPreludeJS(t *testing.T, html string) string {
 		jsConstLine(t, html, "STAGE_TRACKER_MOTION_HUMAN_MODS"),
 		jsFunc(t, html, "stageTrackerMotion"),
 		jsFunc(t, html, "stageTrackerHeaderHtml"),
+		jsConstLine(t, html, "STAGE_TRACKER_TRAIN_ICON_PATH"),
+		jsConstLine(t, html, "STAGE_TRACKER_TRAIN_ICON_TITLE"),
+		jsFunc(t, html, "stageTrackerTrainIconHtml"),
 		jsFunc(t, html, "stageTrackerHoldLabels"),
 		jsFunc(t, html, "stageTrackerSoakLeft"),
 		jsFunc(t, html, "stageTrackerStripItems"),
@@ -166,6 +175,11 @@ func stageTrackerRowsPreludeJS(t *testing.T, html string) string {
 		jsFunc(t, html, "stageTrackerHeadColsHtml"),
 		jsFunc(t, html, "stageTrackerSinceHtml"),
 		jsFunc(t, html, "stageTrackerSubRowHtml"),
+		jsFunc(t, html, "stageTrackerAgoText"),
+		jsConstBlock(t, html, "STAGE_TRACKER_LINEAGE_REASON_TIP"),
+		jsFunc(t, html, "stageTrackerLineageText"),
+		jsFunc(t, html, "stageTrackerLineageTip"),
+		jsFunc(t, html, "stageTrackerLineageChipHtml"),
 		jsFunc(t, html, "stageTrackerLinkedPRItem"),
 		jsFunc(t, html, "stageTrackerLinkedPROpen"),
 		jsFunc(t, html, "stageTrackerNestedOpenPRs"),
@@ -218,7 +232,7 @@ const stages = [
   { number: 70, label: 'Fixing', short: 'Fixing', branch_from: 50 }, { number: 71, label: 'Needs author', short: 'Needs author', branch_from: 50 },
   { number: 72, label: 'Returned to contributor', short: 'Returned to contributor', branch_from: 50 },
   { number: 74, label: 'Adopted by hive', short: 'Adopted by hive', branch_from: 50 },
-  { number: 80, label: 'Awaiting merge admission', short: 'Merge gate' },
+  { number: 80, label: 'Awaiting merge admission', short: 'Merge queue' },
   { number: 85, label: 'Needs human decision', short: 'Needs human decision', branch_from: 80 }, { number: 90, label: 'Ready for human merge', short: 'Ready for human merge', branch_from: 80 },
   { number: 95, label: 'Pre-merge soak', short: 'Soaking', description: 'Lane admitted; the pre-merge soak window is running before the merge is attempted' },
   { number: 100, label: 'Merge queue', short: 'Merge queue' }, { number: 110, label: 'Merged', short: 'Merged' },
@@ -471,8 +485,8 @@ assert.strictEqual(stageTrackerAnchor(95, stages, 'pr'), STAGE_TRACKER_MERGE_COL
 // PR returned to contributor: detour badge rides Review; chip cap = author kind + first modifier (+N).
 row = stageTrackerRowHtml({ repo: 'acme/console', number: 102, kind: 'pr', title: 'Fix flaky', stage: 72, lane: 'contributor', tier: 'trusted', author: 'karibhou', author_kind: 'clanker', author_kind_source: 'inferred', modifiers: ['needs-rebase', 'needs-human'], caption: 'Returned to @karibhou', history: [{number:50,slug:'review-pending'},{number:60,slug:'reviewed'},{number:72,slug:'returned-to-contributor',from:60}] }, stages, ctx);
 assert.deepStrictEqual(segStates(row), [D, D, D, D, 'active detoured', T, 'todo cap']);
-// hivecommons/hive#15159: the chevron names the routing — the contributor's hive, for a clanker's PR.
-assert.ok(row.includes('<span class="ham-detour">Returned to @karibhou&#39;s hive</span>'), row);
+// hivecommons/hive#15159: the chevron names the routing — the contributor's clanker, for a clanker's PR.
+assert.ok(row.includes('<span class="ham-detour">Returned to @karibhou&#39;s clanker</span>'), row);
 // Invariant: a PR never occupies the issue slot. A PR with no linked issue
 // puts the muted "no linked issue" placeholder on the left and names itself
 // — author icon, #N, title — in the PR column, where a covering PR sits on
@@ -702,6 +716,34 @@ assert.ok(/^ data-ham-kind="pr" data-ham-stage="70" data-ham-sub-key="acme\/cons
 assert.ok(prCol(sr[1])[0].includes('ham-author-clanker') && prCol(sr[1])[0].includes('#103'));
 assert.deepStrictEqual(segStates(sr[1]), [B, B, B, 'active', T, T, 'todo cap'], 'a PR at 030 lights PR in progress on its own sub-row');
 assert.ok(!row.slice(0, row.indexOf('<div class="ham-sub"')).includes('ham-pr-ref'), 'the issue title line itself lists no PRs');
+// One-line sub-row header: connector, author icon + #N + title, lineage chip
+// and base pill are direct siblings inside the single flex-row PR cell — no
+// block wrapper or <br> between them — and the title carries its full text
+// as hover for the ellipsis.
+row = stageTrackerRowHtml({ repo: 'acme/console', number: 9, kind: 'issue', title: 'Three PRs', stage: 40, linked_prs: [
+  { number: 15343, title: 'docs: remove duplicate README run routes', author_kind: 'hive', stage: 50, base_ref: 'v5', lineage: { kind: 'adopted', from_number: 15226, from_author: 'x', from_author_kind: 'clanker' } },
+  { number: 15344, title: 'other', stage: 30 },
+] }, stages, ctx);
+sr = subs(row);
+{
+  const head = sr[0].slice(0, sr[0].indexOf('aria-label="Pipeline progress"'));
+  const cell = (head.match(/<li class="ham-seg ham-head-pr">([\s\S]*?)<\/li>/) || [])[1] || '';
+  assert.ok(cell, 'sub-row header has one PR cell: ' + head);
+  assert.ok(!/<br|<div|<p\b/.test(cell), 'no block-level element inside the PR cell: ' + cell);
+  const order = [cell.indexOf('class="ham-linked-ico"'), cell.indexOf('<a class="ham-pr-ref"'), cell.indexOf('class="ham-badge ham-lineage"'), cell.lastIndexOf('<span class="ham-badge">v5</span>')];
+  assert.ok(order.every((i, k) => i >= 0 && (k === 0 || i > order[k - 1])), 'connector, PR link, lineage chip, base pill in that order as siblings: ' + cell);
+  assert.ok(cell.indexOf('<span class="ham-badge">v5</span>') > cell.indexOf('</a>', cell.indexOf('<a class="ham-pr-ref"')), 'the base pill is a sibling after the PR link, not inside it: ' + cell);
+  assert.ok(/<a class="ham-pr-ref"[^>]*title="docs: remove duplicate README run routes · /.test(cell), 'the PR link hover starts with the full title: ' + cell);
+  assert.ok(!head.includes('ham-lineage" title') || head.indexOf('ham-lineage') < head.indexOf('<li class="ham-seg cap">'), 'the lineage chip rides the PR cell, not the chip cap: ' + head);
+  assert.strictEqual((head.match(/ham-lineage/g) || []).length, 1, 'the lineage chip is drawn once');
+}
+// The same order on an issue row with a single covering PR: lineage chip
+// before the base pill, both after the PR link.
+row = stageTrackerRowHtml({ repo: 'acme/console', number: 9, kind: 'issue', title: 'One PR', stage: 40, linked_prs: [{ number: 15343, title: 'T', stage: 50, base_ref: 'v5', lineage: { kind: 'adopted', from_number: 15226 } }] }, stages, ctx);
+{
+  const cell = prCell(row);
+  assert.ok(cell.indexOf('<a class="ham-pr-ref"') < cell.indexOf('ham-lineage') && cell.indexOf('ham-lineage') < cell.indexOf('<span class="ham-badge">v5</span>'), 'PR link, lineage, base pill: ' + cell);
+}
 row = stageTrackerRowHtml({ repo: 'acme/console', number: 10, kind: 'issue', stage: 30 }, stages, ctx);
 assert.deepStrictEqual(segStates(row), [D, D, D, 'active', T, T, 'todo cap'], 'kick running, no PR yet: the issue lights PR in progress and draws the steps ahead');
 assert.strictEqual(subs(row).length, 0, 'no PR yet');
@@ -726,7 +768,11 @@ assert.strictEqual(stageTrackerSortKey({ kind: 'pr', stage: 72 }, stages).anchor
 
 // Header: names once, aligned with the chevrons, plus the since column.
 const head = stageTrackerHeaderHtml(stages);
-assert.deepStrictEqual(Array.from(head.matchAll(/<span class="ham-seg-t">([^<]*)<\/span>/g)).map(m => m[1]), ['Open', 'Actionable', 'Claimed', 'PR in progress', 'CI / Review', 'Merge gate']);
+assert.deepStrictEqual(Array.from(head.matchAll(/<span class="ham-seg-t">(?:<svg[\s\S]*?<\/svg>)?([^<]*)<\/span>/g)).map(m => m[1]), ['Open', 'Actionable', 'Claimed', 'PR in progress', 'CI / Review', 'Merge queue']);
+// The Merge queue column wears the train icon (hover "Merge queue"), the
+// same railcar as the train header chip and the 080 chevron (#15395).
+assert.ok(head.includes('<span class="ham-seg-t">' + stageTrackerTrainIconHtml('ham-ico ham-train-icon ham-col-ico') + 'Merge queue</span>'), head);
+assert.strictEqual((head.match(/<title>Merge queue<\/title>/g) || []).length, 1);
 assert.ok(head.includes('<span class="ham-since">since</span>'));
 
 // Unknown / zero stage lights "Open".

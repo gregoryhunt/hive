@@ -1,0 +1,1 @@
+- A combined review head kick (`review_heads` under `review.combined_perspectives: true`) now tells the head to read the PR once and judge each perspective in its own parallel sub-agent, then record the one verdict array itself, falling back to reviewing the perspectives in sequence when sub-agents are unavailable.

@@ -443,6 +443,25 @@ func TestCombinedHeadPromptFansOutPerPerspective(t *testing.T) {
 	if !strings.Contains(BuildCombinedPrompt(pr, all, PromptOptions{HeadRecordOnly: "cr-sol", Perspectives: set}), "custom security focus from perspective_prompts") {
 		t.Fatal("perspective_prompts override missing from the combined head prompt")
 	}
+
+	// The fan-out must not break the per-head model guarantee: every
+	// sub-agent runs on the head's model, and replaces (not adds to) the
+	// single pinned sub-agent of the independent-review section.
+	pinned := BuildCombinedPrompt(pr, all, PromptOptions{HeadRecordOnly: "cr-sol", Perspectives: set, ReviewBackend: "codex", ReviewModel: "gpt-6-sol"})
+	for _, w := range []string{
+		"Launch EVERY sub-agent with `model` set to `codex/gpt-6-sol`",
+		"instead of that single sub-agent, not in addition to it",
+		"cannot pin `gpt-6-sol`, review the perspectives yourself",
+		`review_model "gpt-6-sol"`,
+	} {
+		if !strings.Contains(pinned, w) {
+			t.Errorf("fan-out does not pin sub-agents to the head model: missing %q", w)
+		}
+	}
+	unpinned := BuildCombinedPrompt(pr, all, PromptOptions{HeadRecordOnly: "cr-sol", Perspectives: set})
+	if !strings.Contains(unpinned, "Run every sub-agent on the model you are running on now") {
+		t.Error("fan-out without a configured head model must keep sub-agents on the session's own model")
+	}
 }
 
 func TestHeadKicksCarryTheHeadModelAndStampPerHead(t *testing.T) {
